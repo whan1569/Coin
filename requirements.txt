@@ -1,5 +1,14 @@
-aiohttp
-numpy
-pandas
-plotly
-streamlit
+# Python 3.11+
+# Binance futures/spot data collector + Streamlit/Plotly viewer
+
+aiohttp>=3.9,<4
+numpy>=1.26,<3
+pandas>=2.2,<3
+plotly>=5.22,<7
+streamlit>=1.35,<2
+
+# Optional but useful for Streamlit + Plotly JSON serialization speed
+orjson>=3.10,<4
+
+# Windows timezone stability for pandas / Asia-Seoul conversions
+tzdata>=2025.2; platform_system == "Windows"
