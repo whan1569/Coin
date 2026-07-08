@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import json
 import os
 import time
 from functools import reduce
@@ -28,6 +29,21 @@ DEFAULT_CONCURRENCY = 15
 DEFAULT_OUTPUT = "data/history_lsoi_15m.csv"
 
 EXCLUDE_SYMBOLS = set()
+
+REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0 CoinCollector/1.0",
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "keep-alive",
+}
+
+RETRYABLE_HTTP_STATUS = {408, 418, 425, 429, 500, 502, 503, 504}
+DEBUG_HEADER_KEYS = [
+    "Retry-After",
+    "X-MBX-USED-WEIGHT",
+    "X-MBX-USED-WEIGHT-1M",
+    "X-MBX-ORDER-COUNT-10S",
+    "X-MBX-ORDER-COUNT-1M",
+]
 
 WEIGHTS = {
     "ls_ratio": 0.35,
@@ -57,6 +73,26 @@ FUNDING_FEATURE_COLS = [
     "funding_rate_8h_pct",
     "funding_daily_pct",
     "funding_abs_8h_pct",
+]
+
+VOLUME_FEATURE_COLS = [
+    "futures_close",
+    "futures_base_volume_15m",
+    "futures_quote_volume_15m",
+    "futures_trade_count_15m",
+    "futures_taker_buy_base_volume_15m",
+    "futures_taker_buy_quote_volume_15m",
+    "futures_quote_volume_15m_prev",
+    "futures_quote_volume_15m_change_pct",
+    "futures_quote_volume_15m_change_ratio",
+    "spot_quote_volume_15m",
+    "spot_quote_volume_15m_prev",
+    "spot_quote_volume_15m_change_pct",
+    "spot_quote_volume_15m_change_ratio",
+    "volume_quote_15m",
+    "volume_quote_15m_prev",
+    "volume_quote_15m_change_pct",
+    "volume_quote_15m_change_ratio",
 ]
 
 
@@ -171,6 +207,7 @@ def normalize_existing_df(df: pd.DataFrame) -> pd.DataFrame:
             "spot_close",
         ]
         + FUNDING_FEATURE_COLS
+        + VOLUME_FEATURE_COLS
     )
 
     for col in numeric_cols:
@@ -233,36 +270,97 @@ async def fetch_json(
     url: str,
     params: Optional[dict] = None,
     semaphore: Optional[asyncio.Semaphore] = None,
-    retries: int = 4,
+    retries: int = 5,
 ):
+    """
+    Binance API 공통 요청 함수.
+
+    수정 포인트:
+    - 418/429/rate-limit 계열에서도 실제 HTTP status/body를 last_error에 남긴다.
+    - 5xx/timeout은 지수 백오프로 재시도한다.
+    - 403/451 같은 접근 제한은 본문을 포함해 즉시 원인을 보여준다.
+    """
     last_error = None
 
-    for attempt in range(retries):
+    async def request_once():
+        if semaphore is None:
+            async with session.get(url, params=params) as response:
+                body = await response.text()
+                return response.status, dict(response.headers), body
+
+        async with semaphore:
+            async with session.get(url, params=params) as response:
+                body = await response.text()
+                return response.status, dict(response.headers), body
+
+    for attempt in range(1, retries + 1):
         try:
-            if semaphore is None:
-                async with session.get(url, params=params) as response:
-                    if response.status in (418, 429):
-                        await asyncio.sleep(2.0 * (attempt + 1))
+            status, headers, body = await request_once()
+
+            debug_headers = {
+                key: headers.get(key)
+                for key in DEBUG_HEADER_KEYS
+                if headers.get(key) is not None
+            }
+
+            if status == 200:
+                try:
+                    return json.loads(body)
+                except json.JSONDecodeError as exc:
+                    last_error = (
+                        f"JSON parse failed: status={status}, "
+                        f"headers={debug_headers}, body={body[:800]}, error={repr(exc)}"
+                    )
+
+                    if attempt < retries:
+                        await asyncio.sleep(min(2 ** attempt, 30))
                         continue
 
-                    response.raise_for_status()
-                    return await response.json()
+                    raise RuntimeError(
+                        f"fetch failed: {url}, params={params}, error={last_error}"
+                    )
 
-            async with semaphore:
-                async with session.get(url, params=params) as response:
-                    if response.status in (418, 429):
-                        await asyncio.sleep(2.0 * (attempt + 1))
-                        continue
+            last_error = (
+                f"HTTP {status}, headers={debug_headers}, body={body[:800]}"
+            )
 
-                    response.raise_for_status()
-                    return await response.json()
+            if status in RETRYABLE_HTTP_STATUS and attempt < retries:
+                retry_after = headers.get("Retry-After")
 
-        except Exception as exc:
-            last_error = exc
-            await asyncio.sleep(0.5 * (attempt + 1))
+                try:
+                    delay = float(retry_after) if retry_after is not None else None
+                except Exception:
+                    delay = None
 
-    raise RuntimeError(f"fetch failed: {url}, params={params}, error={last_error}")
+                if delay is None:
+                    delay = min(2 ** attempt, 30)
 
+                print(
+                    f"[HTTP RETRY] {status} attempt {attempt}/{retries}: "
+                    f"{url}, params={params}, wait={delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            raise RuntimeError(
+                f"fetch failed: {url}, params={params}, error={last_error}"
+            )
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            last_error = repr(exc)
+
+            if attempt < retries:
+                delay = min(2 ** attempt, 30)
+                print(
+                    f"[HTTP RETRY] network attempt {attempt}/{retries}: "
+                    f"{url}, params={params}, error={last_error}, wait={delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                continue
+
+    raise RuntimeError(
+        f"fetch failed after retries: {url}, params={params}, error={last_error}"
+    )
 
 async def fetch_paginated(
     session: aiohttp.ClientSession,
@@ -528,6 +626,81 @@ async def fetch_funding_history(
     return pd.DataFrame(rows)
 
 
+async def fetch_futures_klines(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+) -> pd.DataFrame:
+    """
+    USDT-M perpetual 15m kline 거래량 수집.
+
+    핵심 컬럼:
+    - futures_quote_volume_15m: 해당 15분봉의 quote asset 거래대금
+    - futures_base_volume_15m: 해당 15분봉의 base asset 거래량
+
+    거래량 변화율은 이후 add_volume_features()에서 symbol별 shift(1)로 계산한다.
+    """
+    try:
+        url = f"{BASE_FAPI}/fapi/v1/klines"
+        cursor = start_ms
+        rows = []
+
+        while cursor <= end_ms:
+            params = {
+                "symbol": symbol,
+                "interval": PERIOD,
+                "startTime": cursor,
+                "endTime": end_ms,
+                "limit": 1000,
+            }
+
+            data = await fetch_json(
+                session=session,
+                url=url,
+                params=params,
+                semaphore=semaphore,
+            )
+
+            if not data:
+                break
+
+            for item in data:
+                rows.append(
+                    {
+                        "symbol": symbol,
+                        "timestamp_ms": int(item[0]),
+                        "futures_close": safe_float(item[4]),
+                        "futures_base_volume_15m": safe_float(item[5]),
+                        "futures_quote_volume_15m": safe_float(item[7]),
+                        "futures_trade_count_15m": safe_float(item[8]),
+                        "futures_taker_buy_base_volume_15m": safe_float(item[9]),
+                        "futures_taker_buy_quote_volume_15m": safe_float(item[10]),
+                    }
+                )
+
+            last_open = int(data[-1][0])
+            next_cursor = last_open + PERIOD_MS
+
+            if next_cursor <= cursor:
+                break
+
+            cursor = next_cursor
+
+            if len(data) < 1000:
+                break
+
+        if not rows:
+            return pd.DataFrame()
+
+        return pd.DataFrame(rows).sort_values(["symbol", "timestamp_ms"])
+
+    except Exception as exc:
+        print(f"[WARN] futures kline {symbol} failed: {exc}")
+        return pd.DataFrame()
+
+
 async def fetch_symbol_history_range(
     session: aiohttp.ClientSession,
     semaphore: asyncio.Semaphore,
@@ -565,12 +738,24 @@ async def fetch_symbol_history_range(
             end_ms=end_ms,
         )
 
+        futures_kline_task = fetch_futures_klines(
+            session=session,
+            semaphore=semaphore,
+            symbol=symbol,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
         ratio_dfs = await asyncio.gather(*ratio_tasks)
-        oi_df, funding_df = await asyncio.gather(oi_task, funding_task)
+        oi_df, funding_df, futures_kline_df = await asyncio.gather(
+            oi_task,
+            funding_task,
+            futures_kline_task,
+        )
 
-        dfs = [df for df in ratio_dfs + [oi_df] if df is not None and not df.empty]
+        base_dfs = [df for df in ratio_dfs + [oi_df] if df is not None and not df.empty]
 
-        if len(dfs) < 4:
+        if len(base_dfs) < 4:
             return None
 
         merged = reduce(
@@ -580,11 +765,18 @@ async def fetch_symbol_history_range(
                 on=["symbol", "timestamp_ms"],
                 how="inner",
             ),
-            dfs,
+            base_dfs,
         )
 
         if merged.empty:
             return None
+
+        if futures_kline_df is not None and not futures_kline_df.empty:
+            merged = merged.merge(
+                futures_kline_df,
+                on=["symbol", "timestamp_ms"],
+                how="left",
+            )
 
         return merged, funding_df
 
@@ -944,6 +1136,64 @@ def add_funding_8h_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def add_volume_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    15분 직전 거래량 대비 변화율 컬럼 생성.
+
+    기준:
+    - futures_quote_volume_15m: 선물 15분 quote 거래대금
+    - spot_quote_volume_15m: 현물 15분 quote 거래대금
+    - volume_quote_15m: futures 값 우선, 없으면 spot 값 사용
+
+    변화율:
+    - change_pct = (현재 / 직전 - 1) * 100
+    - change_ratio = 현재 / 직전
+    """
+    out = df.sort_values(["symbol", "timestamp_ms"]).copy()
+
+    numeric_cols = [
+        "futures_quote_volume_15m",
+        "spot_quote_volume_15m",
+    ]
+
+    for col in numeric_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out["volume_quote_15m"] = out["futures_quote_volume_15m"].fillna(
+        out["spot_quote_volume_15m"]
+    )
+
+    for col in [
+        "futures_quote_volume_15m",
+        "spot_quote_volume_15m",
+        "volume_quote_15m",
+    ]:
+        prev_col = f"{col}_prev"
+        change_pct_col = f"{col}_change_pct"
+        change_ratio_col = f"{col}_change_ratio"
+
+        out[prev_col] = out.groupby("symbol")[col].shift(1)
+
+        valid_prev = out[prev_col].notna() & (out[prev_col] > 0)
+
+        out[change_ratio_col] = np.where(
+            valid_prev,
+            out[col] / out[prev_col],
+            np.nan,
+        )
+
+        out[change_pct_col] = np.where(
+            valid_prev,
+            (out[col] / out[prev_col] - 1) * 100,
+            np.nan,
+        )
+
+    return out
+
+
 # =========================================================
 # Scoring
 # =========================================================
@@ -977,6 +1227,13 @@ def add_basic_scoring(df: pd.DataFrame) -> pd.DataFrame:
         "mark_price",
         "spot_quote_volume_24h",
         "spot_quote_volume_24h_current",
+        "spot_quote_volume_15m",
+        "futures_close",
+        "futures_base_volume_15m",
+        "futures_quote_volume_15m",
+        "futures_trade_count_15m",
+        "futures_taker_buy_base_volume_15m",
+        "futures_taker_buy_quote_volume_15m",
         "funding_time_ms",
         "funding_rate",
         "funding_mark_price",
@@ -987,6 +1244,7 @@ def add_basic_scoring(df: pd.DataFrame) -> pd.DataFrame:
             out[col] = pd.to_numeric(out[col], errors="coerce")
 
     out = add_funding_8h_features(out)
+    out = add_volume_features(out)
 
     for col in ["ls_ratio", "ls_acco", "ls_position"]:
         out.loc[out[col] <= 0, col] = np.nan
@@ -1236,6 +1494,20 @@ def save_latest_snapshot(df: pd.DataFrame) -> None:
         "mark_price",
         "oi_nv",
 
+        "futures_close",
+        "futures_base_volume_15m",
+        "futures_quote_volume_15m",
+        "futures_trade_count_15m",
+        "futures_taker_buy_base_volume_15m",
+        "futures_taker_buy_quote_volume_15m",
+        "futures_quote_volume_15m_prev",
+        "futures_quote_volume_15m_change_pct",
+        "futures_quote_volume_15m_change_ratio",
+        "volume_quote_15m",
+        "volume_quote_15m_prev",
+        "volume_quote_15m_change_pct",
+        "volume_quote_15m_change_ratio",
+
         "funding_time_ms",
         "funding_rate",
         "funding_rate_pct",
@@ -1248,6 +1520,10 @@ def save_latest_snapshot(df: pd.DataFrame) -> None:
         "funding_mark_price",
 
         "spot_symbol",
+        "spot_quote_volume_15m",
+        "spot_quote_volume_15m_prev",
+        "spot_quote_volume_15m_change_pct",
+        "spot_quote_volume_15m_change_ratio",
         "spot_quote_volume_24h",
         "spot_market_category",
         "oi_spot_ratio",
@@ -1387,11 +1663,20 @@ async def collect_history(args) -> pd.DataFrame:
 
     existing_df = pd.DataFrame() if args.force else load_existing(args.output)
 
-    timeout = aiohttp.ClientTimeout(total=30)
-    semaphore = asyncio.Semaphore(args.concurrency)
-    connector = aiohttp.TCPConnector(limit=args.concurrency)
+    concurrency = max(1, int(args.concurrency))
+    timeout = aiohttp.ClientTimeout(total=45, connect=15, sock_connect=15, sock_read=30)
+    semaphore = asyncio.Semaphore(concurrency)
+    connector = aiohttp.TCPConnector(
+        limit=concurrency,
+        ttl_dns_cache=300,
+        enable_cleanup_closed=True,
+    )
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+        headers=REQUEST_HEADERS,
+    ) as session:
         symbols = await get_usdt_perp_symbols(session)
 
         print("=== COLLECT CONFIG ===")
@@ -1556,6 +1841,23 @@ def print_summary(df: pd.DataFrame, output: str) -> None:
     print(f"LONG_OVERHEAT: {(latest['direction'] == 'LONG_OVERHEAT').sum():,}")
     print(f"SHORT_OVERHEAT: {(latest['direction'] == 'SHORT_OVERHEAT').sum():,}")
     print(f"MIXED: {(latest['direction'] == 'MIXED').sum():,}")
+
+    if "volume_quote_15m_change_pct" in latest.columns:
+        volume_valid = (
+            latest["volume_quote_15m_change_pct"]
+            .replace([np.inf, -np.inf], np.nan)
+            .dropna()
+        )
+
+        print("\n=== 15M VOLUME CHANGE CHECK ===")
+
+        if volume_valid.empty:
+            print("15분 직전 거래량 대비 변화율 데이터 없음")
+        else:
+            print(f"거래량 변화율 유효 심볼 수: {len(volume_valid):,}")
+            print(f"15m volume change min: {volume_valid.min():.2f}%")
+            print(f"15m volume change median: {volume_valid.median():.2f}%")
+            print(f"15m volume change max: {volume_valid.max():.2f}%")
 
     expected_bars = len(
         expected_timestamps(
