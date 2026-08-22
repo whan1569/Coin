@@ -1,0 +1,17 @@
+# Local runtime data - never sync through Git
+data/
+
+# Generated snapshot CSVs
+binance_ls_lsoi_score.csv
+spot_ok_lsoi.csv
+spot_missing_lsoi.csv
+
+# Python local artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Streamlit/local environment
+.streamlit/secrets.toml
+.env
