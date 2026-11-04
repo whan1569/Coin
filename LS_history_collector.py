@@ -39,6 +39,11 @@ REQUEST_HEADERS = {
     "Connection": "keep-alive",
 }
 
+# Some Binance market-data endpoints require an API-key header.
+# Keep it in the environment; never commit credentials.
+if os.getenv("BINANCE_API_KEY"):
+    REQUEST_HEADERS["X-MBX-APIKEY"] = os.environ["BINANCE_API_KEY"]
+
 RETRYABLE_HTTP_STATUS = {408, 418, 425, 429, 500, 502, 503, 504}
 DEBUG_HEADER_KEYS = [
     "Retry-After",
