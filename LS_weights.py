@@ -1,4 +1,5 @@
 import asyncio
+import os
 import aiohttp
 import numpy as np
 import pandas as pd
@@ -442,7 +443,9 @@ async def scan_binance_ls() -> pd.DataFrame:
     semaphore = asyncio.Semaphore(CONCURRENCY)
     connector = aiohttp.TCPConnector(limit=CONCURRENCY)
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    api_key = os.getenv("BINANCE_API_KEY")
+    headers = {"X-MBX-APIKEY": api_key} if api_key else None
+    async with aiohttp.ClientSession(connector=connector, headers=headers) as session:
         symbols = await get_usdt_perp_symbols(session)
 
         mark_price_task = get_mark_price_map(session)
