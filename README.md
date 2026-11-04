@@ -174,6 +174,9 @@ python -m streamlit run view_pressure.py
   같은 **USDT 거래대금 단위**를 사용합니다. 다른 시각의 현물 봉을 가져와
   현재 선물 값과 합치지 않습니다.
 - `--no-spot-klines` 옵션은 현물 압력 수집을 생략합니다.
+- 일부 선물 시장정보 API가 API 키 헤더를 요구하는 경우, 키를 소스에 넣지 말고
+  PowerShell에서 `$env:BINANCE_API_KEY="발급받은_API_KEY"`로 지정하세요.
+  실제 권한과 API 이용 정책은 Binance 계정/지역별로 확인해야 합니다.
 
 ### 주요 신규 컬럼
 
