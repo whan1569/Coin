@@ -12,6 +12,8 @@ import aiohttp
 import numpy as np
 import pandas as pd
 
+from market_pressure import add_trade_pressure_features
+
 
 # =========================================================
 # 설정
@@ -25,6 +27,7 @@ PERIOD = "15m"
 PERIOD_MS = 15 * 60 * 1000
 
 DEFAULT_DAYS = 20
+DEFAULT_RETAIN_DAYS = 120  # Do not trim long-term history down to API backfill days.
 DEFAULT_CONCURRENCY = 15
 DEFAULT_OUTPUT = "data/history_lsoi_15m.csv"
 
@@ -86,6 +89,7 @@ VOLUME_FEATURE_COLS = [
     "futures_quote_volume_15m_change_pct",
     "futures_quote_volume_15m_change_ratio",
     "spot_quote_volume_15m",
+    "spot_taker_buy_quote_volume_15m",
     "spot_quote_volume_15m_prev",
     "spot_quote_volume_15m_change_pct",
     "spot_quote_volume_15m_change_ratio",
@@ -830,6 +834,7 @@ async def fetch_spot_klines(
                         "timestamp_ms": int(item[0]),
                         "spot_close": safe_float(item[4]),
                         "spot_quote_volume_15m": safe_float(item[7]),
+                        "spot_taker_buy_quote_volume_15m": safe_float(item[10]),
                     }
                 )
 
@@ -947,41 +952,28 @@ def merge_spot_history_asof(
     history_df: pd.DataFrame,
     spot_hist_df: pd.DataFrame,
 ) -> pd.DataFrame:
+    """Match the *same* 15m kline, never a previous bar via backward-asof.
+
+    An unmatched candle remains missing: stale spot turnover should not receive
+    weight in a current futures pressure calculation.
+    """
     if spot_hist_df.empty:
         return history_df
 
-    merged_parts = []
-
-    for spot_symbol, left in history_df.groupby("spot_symbol", dropna=False, sort=False):
-        if pd.isna(spot_symbol):
-            merged_parts.append(left)
-            continue
-
-        right = spot_hist_df[spot_hist_df["spot_symbol"] == spot_symbol].sort_values("timestamp_ms")
-        left = left.sort_values("timestamp_ms")
-
-        if right.empty:
-            merged_parts.append(left)
-            continue
-
-        tmp = pd.merge_asof(
-            left,
-            right[
-                [
-                    "timestamp_ms",
-                    "spot_quote_volume_15m",
-                    "spot_quote_volume_24h",
-                    "spot_close",
-                ]
-            ],
-            on="timestamp_ms",
-            direction="backward",
-            tolerance=PERIOD_MS,
-        )
-
-        merged_parts.append(tmp)
-
-    return pd.concat(merged_parts, ignore_index=True)
+    columns = [
+        "spot_symbol", "timestamp_ms", "spot_quote_volume_15m",
+        "spot_taker_buy_quote_volume_15m", "spot_quote_volume_24h",
+        "spot_close",
+    ]
+    right = spot_hist_df[columns].drop_duplicates(
+        ["spot_symbol", "timestamp_ms"], keep="last"
+    )
+    return history_df.merge(
+        right,
+        on=["spot_symbol", "timestamp_ms"],
+        how="left",
+        validate="many_to_one",
+    )
 
 
 # =========================================================
@@ -1228,6 +1220,7 @@ def add_basic_scoring(df: pd.DataFrame) -> pd.DataFrame:
         "spot_quote_volume_24h",
         "spot_quote_volume_24h_current",
         "spot_quote_volume_15m",
+        "spot_taker_buy_quote_volume_15m",
         "futures_close",
         "futures_base_volume_15m",
         "futures_quote_volume_15m",
@@ -1245,6 +1238,7 @@ def add_basic_scoring(df: pd.DataFrame) -> pd.DataFrame:
 
     out = add_funding_8h_features(out)
     out = add_volume_features(out)
+    out = add_trade_pressure_features(out)
 
     for col in ["ls_ratio", "ls_acco", "ls_position"]:
         out.loc[out[col] <= 0, col] = np.nan
@@ -1500,6 +1494,9 @@ def save_latest_snapshot(df: pd.DataFrame) -> None:
         "futures_trade_count_15m",
         "futures_taker_buy_base_volume_15m",
         "futures_taker_buy_quote_volume_15m",
+        "futures_taker_sell_quote_volume_15m",
+        "futures_net_taker_quote_volume_15m",
+        "futures_trade_pressure_pct",
         "futures_quote_volume_15m_prev",
         "futures_quote_volume_15m_change_pct",
         "futures_quote_volume_15m_change_ratio",
@@ -1521,11 +1518,25 @@ def save_latest_snapshot(df: pd.DataFrame) -> None:
 
         "spot_symbol",
         "spot_quote_volume_15m",
+        "spot_taker_buy_quote_volume_15m",
+        "spot_taker_sell_quote_volume_15m",
+        "spot_net_taker_quote_volume_15m",
+        "spot_trade_pressure_pct",
         "spot_quote_volume_15m_prev",
         "spot_quote_volume_15m_change_pct",
         "spot_quote_volume_15m_change_ratio",
         "spot_quote_volume_24h",
         "spot_market_category",
+        "spot_trade_volume_share_pct",
+        "futures_trade_volume_share_pct",
+        "trade_pressure_quote_asset",
+        "trade_pressure_scope",
+        "trade_pressure_coverage",
+        "trade_pressure_market_count",
+        "trade_pressure_total_quote_volume_15m",
+        "trade_pressure_net_taker_quote_volume_15m",
+        "trade_pressure_turnover_weighted_pct",
+        "trade_pressure_balanced_pct",
         "oi_spot_ratio",
         "oi_pressure_type",
         "oi_pressure_raw",
@@ -1659,7 +1670,8 @@ def combine_score_and_save(
 
 async def collect_history(args) -> pd.DataFrame:
     end_ms = floor_to_period_ms(now_ms(), PERIOD_MS)
-    start_keep_ms = end_ms - args.days * 24 * 60 * 60 * 1000
+    start_fetch_ms = end_ms - args.days * 24 * 60 * 60 * 1000
+    start_keep_ms = end_ms - args.retain_days * 24 * 60 * 60 * 1000
 
     existing_df = pd.DataFrame() if args.force else load_existing(args.output)
 
@@ -1682,10 +1694,12 @@ async def collect_history(args) -> pd.DataFrame:
         print("=== COLLECT CONFIG ===")
         print("mode: ALL USDT PERP")
         print(f"period: {PERIOD} fixed")
-        print(f"days: {args.days}")
+        print(f"fetch_days: {args.days}")
+        print(f"retain_days: {args.retain_days}")
         print(f"symbols: {len(symbols)}")
         print(f"output: {args.output}")
-        print(f"range UTC: {ms_to_utc_str(start_keep_ms)} ~ {ms_to_utc_str(end_ms)}")
+        print(f"fetch range UTC: {ms_to_utc_str(start_fetch_ms)} ~ {ms_to_utc_str(end_ms)}")
+        print(f"retain from UTC: {ms_to_utc_str(start_keep_ms)}")
 
         if args.force:
             print("[FORCE] 기존 파일 무시하고 전체 구간 재수집")
@@ -1699,7 +1713,7 @@ async def collect_history(args) -> pd.DataFrame:
             ranges = get_missing_ranges_for_symbol(
                 existing_df=existing_for_skip,
                 symbol=symbol,
-                start_keep_ms=start_keep_ms,
+                start_keep_ms=start_fetch_ms,
                 end_ms=end_ms,
             )
 
@@ -1958,6 +1972,13 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--retain-days",
+        type=int,
+        default=DEFAULT_RETAIN_DAYS,
+        help="보유 기록 보존 기간(일), 기본 120. API 역조회 --days와 분리됨",
+    )
+
+    parser.add_argument(
         "--concurrency",
         type=int,
         default=DEFAULT_CONCURRENCY,
@@ -1988,8 +2009,10 @@ def parse_args():
 def main():
     args = parse_args()
 
-    if args.days > 29:
-        raise ValueError("L/S와 OI Hist 제한 때문에 --days는 29 이하로 두는 게 안전합니다.")
+    if not 1 <= args.days <= 29:
+        raise ValueError("L/S와 OI Hist 제한 때문에 --days는 1~29로 지정하세요.")
+    if args.retain_days < args.days:
+        raise ValueError("--retain-days는 --days 이상이어야 합니다.")
 
     df = asyncio.run(collect_history(args))
     print_summary(df, args.output)
